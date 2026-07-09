@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>ETF 监控台</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📊</text></svg>">
+<style>
+:root { --plane:#f9f9f7; --surface:#fcfcfb; --ink:#0b0b0b; --muted:#898781; --ring:rgba(11,11,11,.12); --accent:#2a78d6; --bad:#d03b3b; }
+@media (prefers-color-scheme: dark) {
+  :root { --plane:#0d0d0d; --surface:#1a1a19; --ink:#fff; --muted:#898781; --ring:rgba(255,255,255,.12); --accent:#3987e5; --bad:#e66767; }
+}
+* { box-sizing:border-box; margin:0; }
+html, body { height:100%; }
+body { background:var(--plane); font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; color:var(--ink); }
+#gate { min-height:100%; display:flex; align-items:center; justify-content:center; padding:20px; }
+.card { background:var(--surface); border:1px solid var(--ring); border-radius:14px; padding:30px 26px; width:100%; max-width:340px; text-align:center; }
+h1 { font-size:19px; margin-bottom:4px; }
+.sub { color:var(--muted); font-size:12.5px; margin-bottom:18px; }
+input { width:100%; font:16px system-ui; padding:10px 12px; border-radius:9px; border:1px solid var(--ring); background:var(--plane); color:var(--ink); margin-bottom:10px; }
+button { width:100%; font:600 15px system-ui; padding:10px; border-radius:9px; border:none; background:var(--accent); color:#fff; cursor:pointer; }
+#msg { font-size:12.5px; color:var(--bad); margin-top:10px; min-height:1.2em; }
+#frame { display:none; border:0; width:100%; height:100%; }
+#lock { position:fixed; right:10px; bottom:10px; z-index:9; display:none; font-size:11px; color:var(--muted); background:var(--surface); border:1px solid var(--ring); border-radius:99px; padding:4px 10px; cursor:pointer; }
+</style>
+</head>
+<body>
+<div id="gate"><div class="card">
+  <h1>📊 ETF 监控台</h1>
+  <div class="sub">数据经端到端加密托管，输入访问口令解锁<br>（本设备只需输入一次）</div>
+  <input type="password" id="pw" placeholder="访问口令" autocomplete="current-password">
+  <button id="go" type="button">解锁</button>
+  <div id="msg"></div>
+</div></div>
+<iframe id="frame" title="dashboard"></iframe>
+<div id="lock">🔒 锁定</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const b64d = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
+async function deriveKey(pw, salt, iter) {
+  const km = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: iter, hash: "SHA-256" }, km,
+    { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+}
+
+async function unlock(pw, silent) {
+  $("msg").textContent = "";
+  try {
+    const r = await fetch("data.enc?t=" + Date.now(), { cache: "no-store" });
+    if (!r.ok) throw new Error("fetch " + r.status);
+    const j = await r.json();
+    const key = await deriveKey(pw, b64d(j.salt), j.iter || 300000);
+    const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64d(j.iv) }, key, b64d(j.ct));
+    localStorage.setItem("dashpw", pw);
+    $("gate").style.display = "none";
+    $("frame").style.display = "block";
+    $("lock").style.display = "block";
+    $("frame").srcdoc = new TextDecoder().decode(pt);
+  } catch (e) {
+    if (!silent) $("msg").textContent = /fetch/.test(String(e)) ? "数据加载失败，稍后重试" : "口令错误";
+  }
+}
+
+$("go").addEventListener("click", () => unlock($("pw").value, false));
+$("pw").addEventListener("keydown", (e) => { if (e.key === "Enter") unlock($("pw").value, false); });
+$("lock").addEventListener("click", () => { localStorage.removeItem("dashpw"); location.reload(); });
+window.addEventListener("load", () => {
+  const saved = localStorage.getItem("dashpw");
+  if (saved) { $("pw").value = saved; unlock(saved, true); }
+});
+</script>
+</body>
+</html>
