@@ -55,7 +55,12 @@ button { width:100%; font:600 15px system-ui; padding:10px; border-radius:9px; b
     <div class="hint">首次提交需要「回报令牌」（仅限公共仓库的 fine-grained PAT，见 docs/DASH-PAGES-SETUP.md 第 5 步），本设备只输一次：</div>
     <input type="password" id="tok" placeholder="github_pat_...">
   </div>
-  <textarea id="report" placeholder="要回报的内容..."></textarea>
+  <textarea id="report" placeholder="要回报的内容...（可留空只发附件）"></textarea>
+  <div class="row" style="margin-bottom:8px">
+    <button class="ghost" id="pattach" type="button">📎 附件（截图/对账单）</button>
+    <input type="file" id="pfile" accept="image/*,application/pdf" style="display:none">
+  </div>
+  <div id="pfinfo" class="hint" style="display:none"></div>
   <div class="row">
     <button class="ghost" id="pcancel" type="button">取消</button>
     <button id="psend" type="button">加密提交</button>
@@ -103,29 +108,52 @@ window.addEventListener("load", () => {
 const INBOX_REPO = "aidenyan0001/ay-etf-dash";
 const b64e = (bytes) => { let s = ""; bytes.forEach((b) => s += String.fromCharCode(b)); return btoa(s); };
 
-async function encryptReport(text, pw) {
+async function encryptReport(text, pw, fileBytes, fileMeta) {
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const km = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveKey"]);
   const key = await crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: 300000, hash: "SHA-256" }, km,
     { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
-  const payload = new TextEncoder().encode(JSON.stringify({ text, ts: new Date().toISOString() }));
-  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, payload));
-  return JSON.stringify({ v: 1, kind: "user-report", kdf: "PBKDF2-SHA256", iter: 300000, salt: b64e(salt), iv: b64e(iv), ct: b64e(ct) });
+  // v2 容器：4字节头长 + 头JSON(utf8) + 附件原始字节（可为空）
+  const header = new TextEncoder().encode(JSON.stringify({
+    text, ts: new Date().toISOString(),
+    filename: fileMeta ? fileMeta.name : null, mime: fileMeta ? fileMeta.type : null,
+  }));
+  const body = fileBytes || new Uint8Array(0);
+  const container = new Uint8Array(4 + header.length + body.length);
+  new DataView(container.buffer).setUint32(0, header.length);
+  container.set(header, 4);
+  container.set(body, 4 + header.length);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, container));
+  return JSON.stringify({ v: 2, kind: "user-report", kdf: "PBKDF2-SHA256", iter: 300000, salt: b64e(salt), iv: b64e(iv), ct: b64e(ct) });
 }
+
+let attachedFile = null;
+$("pattach").addEventListener("click", () => $("pfile").click());
+$("pfile").addEventListener("change", () => {
+  const f = $("pfile").files[0];
+  if (!f) return;
+  if (f.size > 15 * 1024 * 1024) {
+    $("pmsg").className = "err"; $("pmsg").textContent = "附件超过 15MB，请压缩或截取局部"; $("pfile").value = ""; return;
+  }
+  attachedFile = f;
+  $("pfinfo").style.display = "block";
+  $("pfinfo").textContent = "📎 " + f.name + "（" + (f.size / 1024).toFixed(0) + " KB）— 再点附件可更换";
+});
 
 async function submitReport() {
   const text = $("report").value.trim();
   const pmsg = $("pmsg");
   pmsg.className = ""; pmsg.textContent = "";
-  if (!text) { pmsg.className = "err"; pmsg.textContent = "内容为空"; return; }
+  if (!text && !attachedFile) { pmsg.className = "err"; pmsg.textContent = "写点内容或加个附件"; return; }
   const pw = localStorage.getItem("dashpw");
   if (!pw) { pmsg.className = "err"; pmsg.textContent = "请先解锁仪表盘"; return; }
   let tok = localStorage.getItem("dashtok") || $("tok").value.trim();
   if (!tok) { $("tokwrap").style.display = "block"; pmsg.className = "err"; pmsg.textContent = "首次提交请填入回报令牌"; return; }
   $("psend").disabled = true; pmsg.textContent = "加密提交中…";
   try {
-    const enc = await encryptReport(text, pw);
+    const fileBytes = attachedFile ? new Uint8Array(await attachedFile.arrayBuffer()) : null;
+    const enc = await encryptReport(text, pw, fileBytes, attachedFile);
     const name = "inbox/r-" + new Date().toISOString().replace(/[:.]/g, "-") + ".enc";
     const r = await fetch(`https://api.github.com/repos/${INBOX_REPO}/contents/${name}`, {
       method: "PUT",
@@ -135,6 +163,7 @@ async function submitReport() {
     if (r.status === 201) {
       localStorage.setItem("dashtok", tok);
       $("tokwrap").style.display = "none"; $("report").value = "";
+      attachedFile = null; $("pfile").value = ""; $("pfinfo").style.display = "none";
       pmsg.className = "ok"; pmsg.textContent = "✓ 已提交。系统将在 1 小时内摄取，下次例行运行处理并给出回执。";
     } else if (r.status === 401 || r.status === 403) {
       localStorage.removeItem("dashtok"); $("tokwrap").style.display = "block";
