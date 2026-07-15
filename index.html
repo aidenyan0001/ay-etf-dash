@@ -23,6 +23,18 @@ button { width:100%; font:600 15px system-ui; padding:10px; border-radius:9px; b
 #msg { font-size:12.5px; color:var(--bad); margin-top:10px; min-height:1.2em; }
 #frame { display:none; border:0; width:100%; height:100%; }
 #lock { position:fixed; right:10px; bottom:10px; z-index:9; display:none; font-size:11px; color:var(--muted); background:var(--surface); border:1px solid var(--ring); border-radius:99px; padding:4px 10px; cursor:pointer; }
+#reportbtn { position:fixed; left:10px; bottom:10px; z-index:9; display:none; font:600 12px system-ui; color:#fff; background:var(--accent); border:none; border-radius:99px; padding:7px 14px; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,.25); }
+#panel { position:fixed; inset:0; z-index:10; display:none; align-items:flex-end; justify-content:center; background:rgba(0,0,0,.45); }
+#panel .sheet { background:var(--surface); border:1px solid var(--ring); border-radius:16px 16px 0 0; padding:20px 18px 26px; width:100%; max-width:520px; }
+#panel h2 { font-size:15px; margin-bottom:4px; }
+#panel .hint { font-size:12px; color:var(--muted); margin-bottom:10px; line-height:1.5; }
+#panel textarea { width:100%; min-height:110px; font:15px system-ui; padding:10px 12px; border-radius:9px; border:1px solid var(--ring); background:var(--plane); color:var(--ink); resize:vertical; margin-bottom:8px; }
+#panel .row { display:flex; gap:8px; }
+#panel .row button { flex:1; }
+#panel .ghost { background:var(--plane); color:var(--ink); border:1px solid var(--ring); }
+#tokwrap { display:none; margin-bottom:8px; }
+#pmsg { font-size:12.5px; margin-top:8px; min-height:1.2em; }
+#pmsg.ok { color:#0ca30c; } #pmsg.err { color:var(--bad); }
 </style>
 </head>
 <body>
@@ -35,6 +47,21 @@ button { width:100%; font:600 15px system-ui; padding:10px; border-radius:9px; b
 </div></div>
 <iframe id="frame" title="dashboard"></iframe>
 <div id="lock">🔒 锁定</div>
+<button id="reportbtn" type="button">✍️ 回报</button>
+<div id="panel"><div class="sheet">
+  <h2>✍️ 向监控系统回报</h2>
+  <div class="hint">写下要回报的内容——成交回报、校准数据、或任何要交代的话。内容将用你的口令加密提交，最迟 1 小时内进入系统，由下一次例行运行处理并在仪表盘给出回执。<br>例：「VEA 实际 4.23556018 股；Revolut 显示总盈亏 +$12.3」</div>
+  <div id="tokwrap">
+    <div class="hint">首次提交需要「回报令牌」（仅限公共仓库的 fine-grained PAT，见 docs/DASH-PAGES-SETUP.md 第 5 步），本设备只输一次：</div>
+    <input type="password" id="tok" placeholder="github_pat_...">
+  </div>
+  <textarea id="report" placeholder="要回报的内容..."></textarea>
+  <div class="row">
+    <button class="ghost" id="pcancel" type="button">取消</button>
+    <button id="psend" type="button">加密提交</button>
+  </div>
+  <div id="pmsg"></div>
+</div></div>
 <script>
 const $ = (id) => document.getElementById(id);
 const b64d = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
@@ -57,6 +84,7 @@ async function unlock(pw, silent) {
     $("gate").style.display = "none";
     $("frame").style.display = "block";
     $("lock").style.display = "block";
+    $("reportbtn").style.display = "block";
     $("frame").srcdoc = new TextDecoder().decode(pt);
   } catch (e) {
     if (!silent) $("msg").textContent = /fetch/.test(String(e)) ? "数据加载失败，稍后重试" : "口令错误";
@@ -65,11 +93,68 @@ async function unlock(pw, silent) {
 
 $("go").addEventListener("click", () => unlock($("pw").value, false));
 $("pw").addEventListener("keydown", (e) => { if (e.key === "Enter") unlock($("pw").value, false); });
-$("lock").addEventListener("click", () => { localStorage.removeItem("dashpw"); location.reload(); });
+$("lock").addEventListener("click", () => { localStorage.removeItem("dashpw"); localStorage.removeItem("dashtok"); location.reload(); });
 window.addEventListener("load", () => {
   const saved = localStorage.getItem("dashpw");
   if (saved) { $("pw").value = saved; unlock(saved, true); }
 });
+
+// ---- 回报面板：口令加密 → 提交到公共仓库 inbox/ ----
+const INBOX_REPO = "aidenyan0001/ay-etf-dash";
+const b64e = (bytes) => { let s = ""; bytes.forEach((b) => s += String.fromCharCode(b)); return btoa(s); };
+
+async function encryptReport(text, pw) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const km = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveKey"]);
+  const key = await crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: 300000, hash: "SHA-256" }, km,
+    { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+  const payload = new TextEncoder().encode(JSON.stringify({ text, ts: new Date().toISOString() }));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, payload));
+  return JSON.stringify({ v: 1, kind: "user-report", kdf: "PBKDF2-SHA256", iter: 300000, salt: b64e(salt), iv: b64e(iv), ct: b64e(ct) });
+}
+
+async function submitReport() {
+  const text = $("report").value.trim();
+  const pmsg = $("pmsg");
+  pmsg.className = ""; pmsg.textContent = "";
+  if (!text) { pmsg.className = "err"; pmsg.textContent = "内容为空"; return; }
+  const pw = localStorage.getItem("dashpw");
+  if (!pw) { pmsg.className = "err"; pmsg.textContent = "请先解锁仪表盘"; return; }
+  let tok = localStorage.getItem("dashtok") || $("tok").value.trim();
+  if (!tok) { $("tokwrap").style.display = "block"; pmsg.className = "err"; pmsg.textContent = "首次提交请填入回报令牌"; return; }
+  $("psend").disabled = true; pmsg.textContent = "加密提交中…";
+  try {
+    const enc = await encryptReport(text, pw);
+    const name = "inbox/r-" + new Date().toISOString().replace(/[:.]/g, "-") + ".enc";
+    const r = await fetch(`https://api.github.com/repos/${INBOX_REPO}/contents/${name}`, {
+      method: "PUT",
+      headers: { "Authorization": "Bearer " + tok, "Accept": "application/vnd.github+json" },
+      body: JSON.stringify({ message: "user report", content: btoa(enc) }),
+    });
+    if (r.status === 201) {
+      localStorage.setItem("dashtok", tok);
+      $("tokwrap").style.display = "none"; $("report").value = "";
+      pmsg.className = "ok"; pmsg.textContent = "✓ 已提交。系统将在 1 小时内摄取，下次例行运行处理并给出回执。";
+    } else if (r.status === 401 || r.status === 403) {
+      localStorage.removeItem("dashtok"); $("tokwrap").style.display = "block";
+      pmsg.className = "err"; pmsg.textContent = "令牌无效或过期，请重新填入";
+    } else {
+      pmsg.className = "err"; pmsg.textContent = "提交失败 HTTP " + r.status + "，稍后重试";
+    }
+  } catch (e) {
+    pmsg.className = "err"; pmsg.textContent = "网络错误，稍后重试";
+  }
+  $("psend").disabled = false;
+}
+
+$("reportbtn").addEventListener("click", () => {
+  $("panel").style.display = "flex";
+  if (!localStorage.getItem("dashtok")) $("tokwrap").style.display = "block";
+});
+$("pcancel").addEventListener("click", () => { $("panel").style.display = "none"; });
+$("panel").addEventListener("click", (e) => { if (e.target === $("panel")) $("panel").style.display = "none"; });
+$("psend").addEventListener("click", submitReport);
 </script>
 </body>
 </html>
